@@ -871,9 +871,10 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
-	matcher  *cliproxysession.MerklePrefixMatcher
+	fallback      Selector
+	cache         *SessionCache
+	fallbackCache *SessionCache
+	matcher       *cliproxysession.MerklePrefixMatcher
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -899,9 +900,10 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cfg.TTL = time.Hour
 	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
-		matcher:  cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
+		fallback:      cfg.Fallback,
+		cache:         NewSessionCache(cfg.TTL),
+		fallbackCache: NewSessionCache(cfg.TTL),
+		matcher:       cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
 	}
 }
 
@@ -985,20 +987,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	tempFallbackKey := cacheKey + "::fallback"
-	var tempFallbackKeyFallback string
-	if fallbackKey != "" {
-		tempFallbackKeyFallback = fallbackKey + "::fallback"
-	}
 	collectTempFallbackKeys := func() []string {
-		keys := []string{tempFallbackKey}
-		if tempFallbackKeyFallback != "" {
-			keys = append(keys, tempFallbackKeyFallback)
+		keys := []string{cacheKey}
+		if fallbackKey != "" {
+			keys = append(keys, fallbackKey)
 		}
 		if aliases := s.cache.Aliases(cacheKey); len(aliases) > 0 {
 			for _, alias := range aliases {
 				if alias != "" {
-					keys = append(keys, alias+"::fallback")
+					keys = append(keys, alias)
 				}
 			}
 		}
@@ -1006,7 +1003,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			if aliases := s.cache.Aliases(fallbackKey); len(aliases) > 0 {
 				for _, alias := range aliases {
 					if alias != "" {
-						keys = append(keys, alias+"::fallback")
+						keys = append(keys, alias)
 					}
 				}
 			}
@@ -1014,16 +1011,23 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return keys
 	}
 	bindTempFallback := func(authID string) {
-		s.cache.SetAliases(authID, collectTempFallbackKeys()...)
+		if s.fallbackCache != nil {
+			s.fallbackCache.SetAliases(authID, collectTempFallbackKeys()...)
+		}
 	}
 	invalidateTempFallback := func() {
-		for _, key := range collectTempFallbackKeys() {
-			s.cache.Invalidate(key)
+		if s.fallbackCache != nil {
+			for _, key := range collectTempFallbackKeys() {
+				s.fallbackCache.Invalidate(key)
+			}
 		}
 	}
 	getTempFallbackAuth := func() (*Auth, bool) {
+		if s.fallbackCache == nil {
+			return nil, false
+		}
 		for _, key := range collectTempFallbackKeys() {
-			if tempAuthID, ok := s.cache.GetAndRefresh(key); ok {
+			if tempAuthID, ok := s.fallbackCache.GetAndRefresh(key); ok {
 				for _, auth := range available {
 					if auth.ID == tempAuthID {
 						return auth, true
@@ -1081,6 +1085,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 			if err != nil {
 				return nil, err
+			}
+			if auth == nil {
+				return nil, nil
 			}
 			bindTempFallback(auth.ID)
 			entry.Infof("session-affinity: fallback cache hit but auth unavailable, reselected sticky fallback | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
@@ -1140,16 +1147,16 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 			if auth == nil || auth.ID != match.AuthID {
 				continue
 			}
-			if s.cache != nil && match.SessionID != "" {
-				s.cache.Invalidate(lcpFallbackCacheKey(namespace, match.SessionID))
+			if s.fallbackCache != nil && match.SessionID != "" {
+				s.fallbackCache.Invalidate(lcpFallbackCacheKey(namespace, match.SessionID))
 			}
 			s.matcher.TouchFingerprints(namespace, fingerprints, minPrefixLength, auth.ID)
 			entry.Infof("session-affinity: LCP cache hit | session=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.PrefixLength, auth.ID, provider, model)
 			return auth, true, nil
 		}
 
-		if s.cache != nil && match.SessionID != "" {
-			if fallbackAuthID, okFallback := s.cache.GetAndRefresh(lcpFallbackCacheKey(namespace, match.SessionID)); okFallback {
+		if s.fallbackCache != nil && match.SessionID != "" {
+			if fallbackAuthID, okFallback := s.fallbackCache.GetAndRefresh(lcpFallbackCacheKey(namespace, match.SessionID)); okFallback {
 				for _, auth := range available {
 					if auth != nil && auth.ID == fallbackAuthID {
 						entry.Infof("session-affinity: LCP sticky fallback cache hit | session=%s primary_cooling=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.AuthID, auth.ID, provider, model)
@@ -1166,8 +1173,8 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		if auth == nil {
 			return nil, true, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
-		if s.cache != nil && match.SessionID != "" {
-			s.cache.Set(lcpFallbackCacheKey(namespace, match.SessionID), auth.ID)
+		if s.fallbackCache != nil && match.SessionID != "" {
+			s.fallbackCache.Set(lcpFallbackCacheKey(namespace, match.SessionID), auth.ID)
 		}
 		entry.Infof("session-affinity: LCP primary unavailable, selected sticky fallback | session=%s primary_cooling=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.AuthID, auth.ID, provider, model)
 		return auth, true, nil
@@ -1189,7 +1196,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 }
 
 func lcpFallbackCacheKey(namespace, sessionID string) string {
-	return namespace + "::" + sessionID + "::fallback"
+	return namespace + "::" + sessionID
 }
 
 func lcpAffinityNamespace(provider, model string, metadata map[string]any) string {
@@ -1262,6 +1269,9 @@ func (s *SessionAffinitySelector) Stop() {
 	if s.cache != nil {
 		s.cache.Stop()
 	}
+	if s.fallbackCache != nil {
+		s.fallbackCache.Stop()
+	}
 	if s.matcher != nil {
 		s.matcher.Clear()
 	}
@@ -1275,6 +1285,9 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	}
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
+	}
+	if s.fallbackCache != nil {
+		s.fallbackCache.InvalidateAuth(authID)
 	}
 	if s.matcher != nil {
 		s.matcher.InvalidateAuth(authID)
@@ -1320,19 +1333,19 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 				}
 				if res.Success {
 					if matched && match.AuthID != res.AuthID {
-						if s.cache != nil && fallbackKey != "" {
-							s.cache.Touch(fallbackKey, res.AuthID)
+						if s.fallbackCache != nil && fallbackKey != "" {
+							s.fallbackCache.Touch(fallbackKey, res.AuthID)
 						}
 					} else {
 						s.matcher.TouchFingerprints(namespace, fingerprints, minPrefixLength, res.AuthID)
-						if s.cache != nil && fallbackKey != "" {
-							s.cache.Invalidate(fallbackKey)
+						if s.fallbackCache != nil && fallbackKey != "" {
+							s.fallbackCache.Invalidate(fallbackKey)
 						}
 					}
 				} else if res.Error != nil && isTerminalSessionAffinityError(res.Error) {
 					if matched && match.AuthID != res.AuthID {
-						if s.cache != nil && fallbackKey != "" {
-							s.cache.CompareAndDelete(fallbackKey, res.AuthID)
+						if s.fallbackCache != nil && fallbackKey != "" {
+							s.fallbackCache.CompareAndDelete(fallbackKey, res.AuthID)
 						}
 					} else {
 						s.matcher.RemoveFingerprints(namespace, fingerprints, res.AuthID)
@@ -1354,21 +1367,19 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	}
 
 	cacheKey := ns + "::" + primaryID + "::" + nsModel
-	tempFallbackKey := cacheKey + "::fallback"
-	var fallbackKey, tempFallbackKeyFallback string
+	var fallbackKey string
 	if fallbackID != "" && fallbackID != primaryID && !isSubagentSession(primaryID, fallbackID) {
 		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
-		tempFallbackKeyFallback = fallbackKey + "::fallback"
 	}
 	collectResultTempFallbackKeys := func() []string {
-		keys := []string{tempFallbackKey}
-		if tempFallbackKeyFallback != "" {
-			keys = append(keys, tempFallbackKeyFallback)
+		keys := []string{cacheKey}
+		if fallbackKey != "" {
+			keys = append(keys, fallbackKey)
 		}
 		if aliases := s.cache.Aliases(cacheKey); len(aliases) > 0 {
 			for _, alias := range aliases {
 				if alias != "" {
-					keys = append(keys, alias+"::fallback")
+					keys = append(keys, alias)
 				}
 			}
 		}
@@ -1376,7 +1387,7 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 			if aliases := s.cache.Aliases(fallbackKey); len(aliases) > 0 {
 				for _, alias := range aliases {
 					if alias != "" {
-						keys = append(keys, alias+"::fallback")
+						keys = append(keys, alias)
 					}
 				}
 			}
@@ -1388,8 +1399,10 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		if fallbackKey != "" {
 			s.cache.Touch(fallbackKey, res.AuthID)
 		}
-		for _, tk := range collectResultTempFallbackKeys() {
-			s.cache.Touch(tk, res.AuthID)
+		if s.fallbackCache != nil {
+			for _, tk := range collectResultTempFallbackKeys() {
+				s.fallbackCache.Touch(tk, res.AuthID)
+			}
 		}
 		return
 	}
@@ -1399,8 +1412,10 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		if fallbackKey != "" {
 			s.cache.CompareAndDelete(fallbackKey, res.AuthID)
 		}
-		for _, tk := range collectResultTempFallbackKeys() {
-			s.cache.CompareAndDelete(tk, res.AuthID)
+		if s.fallbackCache != nil {
+			for _, tk := range collectResultTempFallbackKeys() {
+				s.fallbackCache.CompareAndDelete(tk, res.AuthID)
+			}
 		}
 	}
 }
