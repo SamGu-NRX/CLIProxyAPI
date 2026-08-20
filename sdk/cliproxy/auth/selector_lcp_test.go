@@ -174,7 +174,7 @@ func TestSessionAffinitySelectorLCPFailureRemovesExactSequence(t *testing.T) {
 		AuthID:   first.ID,
 		Provider: "openai",
 		Model:    "model",
-		Error:    &Error{Code: "rate_limited", Message: "rate limited"},
+		Error:    &Error{Code: "unauthorized", HTTPStatus: http.StatusUnauthorized, Message: "invalid api key"},
 		Options:  opts,
 	})
 
