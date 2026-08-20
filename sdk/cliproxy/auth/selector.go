@@ -985,15 +985,27 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
+	tempFallbackKey := cacheKey + "::fallback"
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				s.cache.Invalidate(tempFallbackKey)
 				bind(auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
+		// Primary cached auth is unavailable (cooling down).
+		// Check for an active sticky temporary fallback binding:
+		if tempAuthID, ok := s.cache.GetAndRefresh(tempFallbackKey); ok {
+			for _, auth := range available {
+				if auth.ID == tempAuthID {
+					entry.Infof("session-affinity: sticky fallback cache hit | session=%s primary_cooling=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
+					return auth, nil
+				}
+			}
+		}
+		// Reselect fallback auth and record it as the sticky temporary fallback
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
@@ -1001,17 +1013,28 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if auth == nil {
 			return nil, nil
 		}
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		s.cache.Set(tempFallbackKey, auth.ID)
+		entry.Infof("session-affinity: cache hit but auth unavailable, reselected sticky fallback | session=%s primary_cooling=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
 		return auth, nil
 	}
 
 	if fallbackKey != "" {
+		tempFallbackKeyFallback := fallbackKey + "::fallback"
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					if !isSubagent || allowsSubagentAuthInheritance(auth, model) {
+						s.cache.Invalidate(tempFallbackKeyFallback)
 						bind(auth.ID)
 						entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+						return auth, nil
+					}
+				}
+			}
+			if tempAuthID, ok := s.cache.GetAndRefresh(tempFallbackKeyFallback); ok {
+				for _, auth := range available {
+					if auth.ID == tempAuthID {
+						entry.Infof("session-affinity: sticky secondary fallback cache hit | session=%s fallback=%s temp_auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 						return auth, nil
 					}
 				}
@@ -1020,7 +1043,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			if err != nil {
 				return nil, err
 			}
-			entry.Infof("session-affinity: fallback cache hit but auth unavailable, reselected | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+			s.cache.Set(tempFallbackKeyFallback, auth.ID)
+			entry.Infof("session-affinity: fallback cache hit but auth unavailable, reselected sticky fallback | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 			return auth, nil
 		}
 	}
@@ -1066,23 +1090,50 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if errAvailable != nil {
 		return nil, true, errAvailable
 	}
+	fallbackAuths := highestPriorityAuths(available)
 
 	if match, ok := s.matcher.MatchFingerprints(namespace, fingerprints, minPrefixLength); ok {
+		if match.SessionID != "" {
+			opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
+			opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
+		}
 		for _, auth := range available {
 			if auth == nil || auth.ID != match.AuthID {
 				continue
 			}
-			s.matcher.TouchFingerprints(namespace, fingerprints, minPrefixLength, auth.ID)
-			if match.SessionID != "" {
-				opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
-				opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
+			if s.cache != nil && match.SessionID != "" {
+				s.cache.Invalidate(lcpFallbackCacheKey(namespace, match.SessionID))
 			}
+			s.matcher.TouchFingerprints(namespace, fingerprints, minPrefixLength, auth.ID)
 			entry.Infof("session-affinity: LCP cache hit | session=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.PrefixLength, auth.ID, provider, model)
 			return auth, true, nil
 		}
+
+		if s.cache != nil && match.SessionID != "" {
+			if fallbackAuthID, okFallback := s.cache.GetAndRefresh(lcpFallbackCacheKey(namespace, match.SessionID)); okFallback {
+				for _, auth := range available {
+					if auth != nil && auth.ID == fallbackAuthID {
+						entry.Infof("session-affinity: LCP sticky fallback cache hit | session=%s primary_cooling=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.AuthID, auth.ID, provider, model)
+						return auth, true, nil
+					}
+				}
+			}
+		}
+
+		auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		if errPick != nil {
+			return nil, true, errPick
+		}
+		if auth == nil {
+			return nil, true, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if s.cache != nil && match.SessionID != "" {
+			s.cache.Set(lcpFallbackCacheKey(namespace, match.SessionID), auth.ID)
+		}
+		entry.Infof("session-affinity: LCP primary unavailable, selected sticky fallback | session=%s primary_cooling=%s fallback_auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.AuthID, auth.ID, provider, model)
+		return auth, true, nil
 	}
 
-	fallbackAuths := highestPriorityAuths(available)
 	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	if errPick != nil {
 		return nil, true, errPick
@@ -1096,6 +1147,10 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		entry.Infof("session-affinity: LCP cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(sessionID), auth.ID, provider, model)
 	}
 	return auth, true, nil
+}
+
+func lcpFallbackCacheKey(namespace, sessionID string) string {
+	return namespace + "::" + sessionID + "::fallback"
 }
 
 func lcpAffinityNamespace(provider, model string, metadata map[string]any) string {
@@ -1241,22 +1296,28 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	}
 
 	cacheKey := ns + "::" + primaryID + "::" + nsModel
-	var fallbackKey string
+	tempFallbackKey := cacheKey + "::fallback"
+	var fallbackKey, tempFallbackKeyFallback string
 	if fallbackID != "" && fallbackID != primaryID && !isSubagentSession(primaryID, fallbackID) {
 		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
+		tempFallbackKeyFallback = fallbackKey + "::fallback"
 	}
 	if res.Success {
 		s.cache.Touch(cacheKey, res.AuthID)
+		s.cache.Touch(tempFallbackKey, res.AuthID)
 		if fallbackKey != "" {
 			s.cache.Touch(fallbackKey, res.AuthID)
+			s.cache.Touch(tempFallbackKeyFallback, res.AuthID)
 		}
 		return
 	}
 
 	if res.Error != nil && isTerminalSessionAffinityError(res.Error) {
 		s.cache.CompareAndDelete(cacheKey, res.AuthID)
+		s.cache.CompareAndDelete(tempFallbackKey, res.AuthID)
 		if fallbackKey != "" {
 			s.cache.CompareAndDelete(fallbackKey, res.AuthID)
+			s.cache.CompareAndDelete(tempFallbackKeyFallback, res.AuthID)
 		}
 	}
 }
