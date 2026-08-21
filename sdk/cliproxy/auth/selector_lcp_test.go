@@ -882,3 +882,89 @@ func BenchmarkSessionAffinitySelectorPickLCP(b *testing.B) {
 		_, _ = selector.Pick(context.Background(), "openai", "gpt-4o", opts, auths)
 	}
 }
+
+func TestSessionAffinitySelectorLCPTransient429RetainsPrimaryBinding(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAI,
+		OriginalRequest: []byte(`{"messages":[{"role":"user","content":"transient quota"}]}`),
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey: "caller-transient",
+		},
+	}
+	first, err := selector.Pick(context.Background(), "openai", "model", opts, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+
+	selector.OnResult(Result{
+		AuthID:   first.ID,
+		Provider: "openai",
+		Model:    "model",
+		Error:    &Error{Code: "rate_limited", HTTPStatus: http.StatusTooManyRequests, Message: "rate limited"},
+		Options:  opts,
+	})
+
+	recovered, err := selector.Pick(context.Background(), "openai", "model", opts, auths)
+	if err != nil {
+		t.Fatalf("recovered Pick() error = %v", err)
+	}
+	if recovered.ID != first.ID {
+		t.Fatalf("transient 429 changed LCP primary from %q to %q", first.ID, recovered.ID)
+	}
+}
+
+func TestSessionAffinitySelectorLCPStickyFallbackRestoresPrimary(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	authA := &Auth{ID: "auth-a"}
+	authB := &Auth{ID: "auth-b"}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAI,
+		OriginalRequest: []byte(`{"messages":[{"role":"user","content":"cooldown fallback"}]}`),
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey: "caller-cooldown",
+		},
+	}
+	primary, err := selector.Pick(context.Background(), "openai", "model", opts, []*Auth{authA, authB})
+	if err != nil {
+		t.Fatalf("primary Pick() error = %v", err)
+	}
+	if primary.ID != authA.ID {
+		t.Fatalf("primary Pick() = %q, want %q", primary.ID, authA.ID)
+	}
+
+	firstFallback, err := selector.Pick(context.Background(), "openai", "model", opts, []*Auth{authB})
+	if err != nil {
+		t.Fatalf("first fallback Pick() error = %v", err)
+	}
+	secondFallback, err := selector.Pick(context.Background(), "openai", "model", opts, []*Auth{authB})
+	if err != nil {
+		t.Fatalf("second fallback Pick() error = %v", err)
+	}
+	if firstFallback.ID != authB.ID || secondFallback.ID != authB.ID {
+		t.Fatalf("LCP fallback was not sticky: first=%q second=%q want=%q", firstFallback.ID, secondFallback.ID, authB.ID)
+	}
+
+	recovered, err := selector.Pick(context.Background(), "openai", "model", opts, []*Auth{authA, authB})
+	if err != nil {
+		t.Fatalf("recovered Pick() error = %v", err)
+	}
+	if recovered.ID != authA.ID {
+		t.Fatalf("LCP recovery kept fallback %q, want sticky primary %q", recovered.ID, authA.ID)
+	}
+}

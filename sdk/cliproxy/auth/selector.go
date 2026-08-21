@@ -989,6 +989,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	collectTempFallbackKeys := func() []string {
 		keys := []string{cacheKey}
+		// Subagents have independent credentials on providers that cannot safely
+		// inherit the parent binding. Their temporary fallback must stay independent too.
+		if isSubagent {
+			return keys
+		}
 		if fallbackKey != "" {
 			keys = append(keys, fallbackKey)
 		}
