@@ -795,7 +795,32 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	return available[0], nil
 }
 
+// isAuthBlockedForModel reports whether auth can serve model right now. It is the single
+// availability predicate every selector, the scheduler, and the executor's candidate filter
+// share. When the model's own state is cooling but the auth carries a `fallback: true` alias
+// for that model whose upstream is not cooling, the auth is NOT blocked: it can still serve
+// through the fallback. Whether the fallback is actually tried is decided elsewhere (the
+// executor admits fallback candidates only in its second pass), so this admission never causes
+// a fallback request on its own; it only stops the selector from discarding a credential that
+// the second pass could use.
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	blocked, reason, next := isAuthBlockedForModelStrict(auth, model, now)
+	if !blocked || reason == blockReasonDisabled || strings.TrimSpace(model) == "" {
+		return blocked, reason, next
+	}
+	for _, fallback := range FallbackUpstreamModels(auth, model) {
+		if canonicalModelKey(fallback) == canonicalModelKey(model) {
+			continue
+		}
+		if fbBlocked, _, _ := isAuthBlockedForModelStrict(auth, fallback, now); !fbBlocked {
+			return false, blockReasonNone, time.Time{}
+		}
+	}
+	return blocked, reason, next
+}
+
+// isAuthBlockedForModelStrict is the fallback-unaware predicate: exactly the model asked for.
+func isAuthBlockedForModelStrict(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}

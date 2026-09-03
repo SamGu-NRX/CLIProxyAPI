@@ -301,7 +301,9 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
 		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
-		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
+		// Strict: this filters concrete upstream names. Fallback awareness here would let a
+		// cooling ordinary candidate through on the strength of its own fallback.
+		blocked, _, _ := isAuthBlockedForModelStrict(auth, stateModel, now)
 		if blocked {
 			continue
 		}
@@ -316,12 +318,12 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]stri
 	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
-func (m *Manager) preparedExecutionModelsWithAlias(auth *Auth, routeModel string) ([]string, bool, OAuthModelAliasResult, *apiKeyModelRoutingSnapshot) {
-	candidates, pooled, aliasResult, routing := m.executionModelCandidatesWithAlias(auth, routeModel)
+func (m *Manager) preparedExecutionModelsWithAlias(auth *Auth, routeModel string, fallbackPhase bool) ([]string, bool, OAuthModelAliasResult, *apiKeyModelRoutingSnapshot) {
+	candidates, pooled, aliasResult, routing := m.executionModelCandidatesWithAlias(auth, routeModel, fallbackPhase)
 	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled, aliasResult, routing
 }
 
-func (m *Manager) executionModelCandidatesWithAlias(auth *Auth, routeModel string) ([]string, bool, OAuthModelAliasResult, *apiKeyModelRoutingSnapshot) {
+func (m *Manager) executionModelCandidatesWithAlias(auth *Auth, routeModel string, fallbackPhase bool) ([]string, bool, OAuthModelAliasResult, *apiKeyModelRoutingSnapshot) {
 	routing := m.loadAPIKeyModelRouting()
 	requestedModel := rewriteModelForAuth(routeModel, auth)
 	aliasResult := m.resolveExecutionAliasResultForRequestedWithRouting(routing, auth, requestedModel)
@@ -352,8 +354,41 @@ func (m *Manager) executionModelCandidatesWithAlias(auth *Auth, routeModel strin
 			candidates = []string{resolved}
 		}
 	}
+	// Last-resort upstreams come after every ordinary candidate. The executor walks this
+	// list in order and filterExecutionModels drops cooling entries, so a fallback is sent
+	// only once the ordinary upstream on THIS credential is cooling; fill-first ordering
+	// across credentials means every other credential's ordinary candidate was tried first.
+	// That is the property that keeps a separate allowance (Codex gpt-reserve) from being
+	// requested while any ordinary capacity remains anywhere in the pool.
+	if fallbackPhase {
+		candidates = appendFallbackCandidates(auth, requestedModel, candidates)
+	}
 	pooled := len(candidates) > 1
 	return candidates, pooled, aliasResult, routing
+}
+
+func appendFallbackCandidates(auth *Auth, requestedModel string, candidates []string) []string {
+	fallbacks := FallbackUpstreamModels(auth, requestedModel)
+	if len(fallbacks) == 0 {
+		return candidates
+	}
+	seen := make(map[string]struct{}, len(candidates)+len(fallbacks))
+	for _, c := range candidates {
+		seen[strings.ToLower(strings.TrimSpace(c))] = struct{}{}
+	}
+	out := append([]string(nil), candidates...)
+	for _, f := range fallbacks {
+		key := strings.ToLower(strings.TrimSpace(f))
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, f)
+	}
+	return out
 }
 
 func (m *Manager) resolveExecutionAliasResult(auth *Auth, routeModel string) OAuthModelAliasResult {

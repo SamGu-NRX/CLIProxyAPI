@@ -717,6 +717,46 @@ func TestFileSynthesizer_Synthesize_OAuthModelAliases(t *testing.T) {
 	}
 }
 
+// fallback_models is its own credential key. It must land on the auth as its own attribute
+// and must NOT leak into model_aliases, where a pre-feature binary would read it as a plain
+// rename and request the fallback upstream on fresh windows.
+func TestFileSynthesizer_Synthesize_FallbackModelsAreSeparateFromAliases(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"type":  "codex",
+		"email": "codex@example.com",
+		"fallback_models": []map[string]any{
+			{"name": " gpt-reserve ", "alias": " gpt-5.6-luna "},
+			{"name": "", "alias": "ignored"},
+		},
+	}
+	data, _ := json.Marshal(authData)
+	if err := os.WriteFile(filepath.Join(tempDir, "codex-auth.json"), data, 0644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if got, want := auths[0].Attributes["fallback_models"], `[{"name":"gpt-reserve","alias":"gpt-5.6-luna"}]`; got != want {
+		t.Fatalf("expected fallback_models %q, got %q", want, got)
+	}
+	if got := auths[0].Attributes["model_aliases"]; got != "" {
+		t.Fatalf("fallback_models must not populate model_aliases, got %q", got)
+	}
+}
+
 func TestFileSynthesizer_Synthesize_IgnoresGeminiOAuthFile(t *testing.T) {
 	tempDir := t.TempDir()
 

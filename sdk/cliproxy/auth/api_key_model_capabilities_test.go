@@ -82,14 +82,14 @@ func TestAttachResolvedAPIKeyModelInfoPrefersExactConfiguredSuffix(t *testing.T)
 	req := manager.attachResolvedAPIKeyModelInfo(cliproxyexecutor.Request{}, auth, "tenant/public-low", "shared-upstream(low)")
 	assertResolvedThinkingLevels(t, req, "low")
 
-	models, _, _, routing := manager.executionModelCandidatesWithAlias(auth, "tenant/shared-upstream(low)")
+	models, _, _, routing := manager.executionModelCandidatesWithAlias(auth, "tenant/shared-upstream(low)", false)
 	if len(models) != 1 || models[0] != "shared-upstream(low)" {
 		t.Fatalf("direct suffixed models = %v, want [shared-upstream(low)]", models)
 	}
 	directReq := attachResolvedAPIKeyModelInfo(routing, cliproxyexecutor.Request{}, auth, "tenant/shared-upstream(low)", models[0])
 	assertResolvedThinkingLevels(t, directReq, "low")
 
-	aliasModels, _, _, aliasRouting := manager.executionModelCandidatesWithAlias(auth, "tenant/public(low)")
+	aliasModels, _, _, aliasRouting := manager.executionModelCandidatesWithAlias(auth, "tenant/public(low)", false)
 	if len(aliasModels) != 1 || aliasModels[0] != "alias-upstream(low)" {
 		t.Fatalf("suffixed alias models = %v, want [alias-upstream(low)]", aliasModels)
 	}
@@ -113,7 +113,7 @@ func TestAPIKeyModelRoutingClonesPublishedConfig(t *testing.T) {
 
 	auth := configuredCapabilityTestAuth("auth-clone", "key-clone")
 	registerCapabilityTestAuth(t, manager, auth)
-	models, _, _, routing := manager.executionModelCandidatesWithAlias(auth, "tenant/public")
+	models, _, _, routing := manager.executionModelCandidatesWithAlias(auth, "tenant/public", false)
 	if len(models) != 1 || models[0] != "shared-upstream" {
 		t.Fatalf("cloned execution models = %v, want [shared-upstream]", models)
 	}
@@ -136,7 +136,7 @@ func TestAPIKeyModelRoutingKeepsOneExecutionSnapshotAcrossReload(t *testing.T) {
 	}
 	manager.SetConfig(buildConfig("high"))
 	registerCapabilityTestAuth(t, manager, auth)
-	models, _, _, oldRouting := manager.executionModelCandidatesWithAlias(auth, "tenant/public")
+	models, _, _, oldRouting := manager.executionModelCandidatesWithAlias(auth, "tenant/public", false)
 	if len(models) != 1 || models[0] != "shared-upstream" {
 		t.Fatalf("execution models = %v, want [shared-upstream]", models)
 	}
@@ -176,7 +176,7 @@ func TestAttachResolvedAPIKeyModelInfoSupportsKeylessOpenAICompatibility(t *test
 		},
 	}
 	registerCapabilityTestAuth(t, manager, auth)
-	models, _, aliasResult, routing := manager.executionModelCandidatesWithAlias(auth, "tenant/public-model")
+	models, _, aliasResult, routing := manager.executionModelCandidatesWithAlias(auth, "tenant/public-model", false)
 	if len(models) != 2 || models[0] != "shared-upstream" || models[1] != "fallback-upstream" {
 		t.Fatalf("keyless execution models = %v, want [shared-upstream fallback-upstream]", models)
 	}

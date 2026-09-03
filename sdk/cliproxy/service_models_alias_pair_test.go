@@ -37,3 +37,15 @@ func TestOAuthModelAliasesForAuthStillDedupesSamePair(t *testing.T) {
 		t.Fatalf("expected one entry, the per-auth one, got %+v", got)
 	}
 }
+
+// A fallback lives under its own credential key, never in model_aliases, so the catalog
+// merge cannot see it: gpt-reserve is a last-resort upstream for the ordinary client id, not
+// a new client-visible model. This pins that a credential carrying only fallback_models
+// contributes nothing to the alias table.
+func TestFallbackModelsAreInvisibleToTheAliasTable(t *testing.T) {
+	attrs := map[string]string{"fallback_models": `[{"name":"gpt-reserve","alias":"gpt-5.6-luna"}]`}
+	got := oauthModelAliasesForAuth(&config.Config{}, "codex", attrs)
+	if len(got) != 0 {
+		t.Fatalf("expected no alias entries from fallback_models, got %+v", got)
+	}
+}

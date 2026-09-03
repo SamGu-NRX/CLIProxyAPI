@@ -198,6 +198,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 		if !failed && (ephemeralResult || claudeOAuthRequestCancellation(ctx, auth, nil) == nil) {
 			m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: true, Options: opts}, auth, ephemeralResult)
+			logFallbackServed(ctx, auth, routeModel, resultModel, fallbackPhase(opts))
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}

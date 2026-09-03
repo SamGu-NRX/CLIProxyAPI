@@ -104,6 +104,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 			}
 			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
+			perAccountFallbacks := extractFallbackModelsFromMetadata(metadata)
 			disabled, _ := metadata["disabled"].(bool)
 			for index, auth := range auths {
 				if auth == nil {
@@ -133,6 +134,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 					return nil, fmt.Errorf("invalid plugin auth weight in %s: %w", filepath.Base(fullPath), errWeight)
 				}
 				coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
+				coreauth.SetFallbackModelsAttribute(auth, perAccountFallbacks)
 				ApplyAuthExcludedModelsMeta(auth, cfg, perAccountExcluded, "oauth")
 				coreauth.ApplyCustomHeadersFromMetadata(auth)
 				applyFingerprintProfileAttribute(auth, metadata)
@@ -181,6 +183,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	// Read per-account excluded models from the OAuth JSON file.
 	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 	perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
+	perAccountFallbacks := extractFallbackModelsFromMetadata(metadata)
 
 	a := &coreauth.Auth{
 		ID:       id,
@@ -224,6 +227,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
+	coreauth.SetFallbackModelsAttribute(a, perAccountFallbacks)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	applyFingerprintProfileAttribute(a, metadata)
 	// For codex auth files, extract plan_type from the JWT id_token.
@@ -298,6 +302,28 @@ func extractOAuthModelAliasesFromMetadata(metadata map[string]any) []config.OAut
 	}
 	cfg.SanitizeOAuthModelAlias()
 	return cfg.OAuthModelAlias["auth"]
+}
+
+// extractFallbackModelsFromMetadata reads a credential's last-resort upstreams
+// (`fallback_models`: [{name, alias}]) from the OAuth JSON metadata. Malformed input reads as
+// none; the credential then simply has no fallback.
+func extractFallbackModelsFromMetadata(metadata map[string]any) []config.FallbackModel {
+	if metadata == nil {
+		return nil
+	}
+	raw, ok := metadata["fallback_models"]
+	if !ok || raw == nil {
+		return nil
+	}
+	data, errMarshal := json.Marshal(raw)
+	if errMarshal != nil {
+		return nil
+	}
+	var out []config.FallbackModel
+	if errUnmarshal := json.Unmarshal(data, &out); errUnmarshal != nil {
+		return nil
+	}
+	return out
 }
 
 // extractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.

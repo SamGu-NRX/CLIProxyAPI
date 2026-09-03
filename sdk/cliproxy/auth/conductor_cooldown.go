@@ -1233,6 +1233,32 @@ func modelStateIsClean(state *ModelState) bool {
 	return true
 }
 
+// authHasOpenFallback reports whether any cooling model on this auth has a fallback upstream
+// that is not itself cooling. Reads only the auth's own attributes and model states.
+func authHasOpenFallback(auth *Auth, now time.Time) bool {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return false
+	}
+	for model, state := range auth.ModelStates {
+		if state == nil || !state.Unavailable {
+			continue
+		}
+		for _, fallback := range FallbackUpstreamModels(auth, model) {
+			if canonicalModelKey(fallback) == canonicalModelKey(model) {
+				continue
+			}
+			fbState := existingModelState(auth, fallback)
+			if fbState == nil {
+				return true // never tried: open by definition
+			}
+			if blocked, _, _ := availabilityBlock(fbState.Unavailable, fbState.Quota.Exceeded, fbState.NextRetryAfter, fbState.Quota.NextRecoverAt, now); !blocked && fbState.Status != StatusDisabled {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
@@ -1288,6 +1314,15 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	if !hasState {
 		clearAggregatedAvailability(auth)
 		return
+	}
+	// A cooling model whose per-auth fallback upstream is still open keeps the credential
+	// available. Without this, an account whose only tracked model is cooling is lifted to
+	// auth-level Unavailable, the built-in selectors (which check at auth level) drop it, and
+	// the fallback pass can never reach it. The fallback's own state, once it exists, is a
+	// ModelState like any other and participates in the loop above; this covers the moment
+	// before it has ever been tried.
+	if allUnavailable && authHasOpenFallback(auth, now) {
+		allUnavailable = false
 	}
 	auth.Unavailable = allUnavailable
 	if allUnavailable {

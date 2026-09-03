@@ -164,6 +164,17 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		lastErr = preferredExecutionAttemptError(lastErr, preferredUpstreamErr)
 		lastErr = unwrapExecutionBoundaryError(lastErr)
+		// Second pass, fallback-admitting. Runs only once every ordinary upstream across the
+		// pool has been tried or found cooling, which is what the ordinary rounds above
+		// guarantee before they break. Bounded to one pass: a fallback that also cools ends
+		// the request with that error rather than re-entering the ordinary loop.
+		if !fallbackPhase(opts) && fallbackPassWorthTrying(lastErr) && m.hasFallbackForRoute(normalized, retryModel) {
+			if resp, errFallback := m.executeMixedOnce(ctx, normalized, req, withFallbackPhase(opts), maxRetryCredentials, 0, defaultRequestRetry); errFallback == nil {
+				return resp, nil
+			} else if hasUpstreamExecutionAttempt(errFallback) {
+				lastErr = unwrapExecutionBoundaryError(errFallback)
+			}
+		}
 		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts); errCredits != nil {
 				return cliproxyexecutor.Response{}, errCredits
@@ -174,6 +185,65 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return cliproxyexecutor.Response{}, lastErr
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+// logFallbackServed writes one INFO line when a request was served by a fallback upstream.
+// This is the only place the reserve becomes visible in an ordinary (non-debug) log, and it is
+// the line an operator greps to answer "did the reserve fire, on which account, how often".
+func logFallbackServed(ctx context.Context, auth *Auth, routeModel, upstreamModel string, phase bool) {
+	if !phase || auth == nil {
+		return
+	}
+	if canonicalModelKey(upstreamModel) == canonicalModelKey(routeModel) {
+		return
+	}
+	if entry := logEntryWithRequestID(ctx); entry != nil {
+		entry.Infof("fallback: served route=%s via upstream=%s auth=%s", routeModel, upstreamModel, auth.ID)
+	}
+}
+
+// hasFallbackForRoute reports whether any enabled auth in the given providers carries a
+// last-resort upstream for routeModel. Cheap: it reads attributes only, no registry.
+func (m *Manager) hasFallbackForRoute(providers []string, routeModel string) bool {
+	if m == nil || strings.TrimSpace(routeModel) == "" {
+		return false
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, p := range providers {
+		providerSet[strings.ToLower(strings.TrimSpace(p))] = struct{}{}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil || auth.Disabled {
+			continue
+		}
+		if _, ok := providerSet[executorKeyFromAuth(auth)]; !ok {
+			continue
+		}
+		if len(FallbackUpstreamModels(auth, routeModel)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// fallbackPassWorthTrying is the gate on the second pass: the ordinary pass must have ended
+// because capacity was cooling (a quota-class 429 from upstream, or the selector's own
+// "all cooling" verdict), not because the request was bad, cancelled, or stopped. A fallback
+// tried after a 400 would just repeat the 400 against a scarcer allowance.
+func fallbackPassWorthTrying(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isRequestTerminatedError(err) || isRequestStopError(err) || isRequestInvalidError(err) {
+		return false
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(err, &cooldownErr) {
+		return true
+	}
+	return statusCodeFromError(err) == http.StatusTooManyRequests
 }
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
@@ -222,7 +292,15 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			}
 		}
 		lastErr = preferredExecutionAttemptError(lastErr, preferredUpstreamErr)
-		return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(lastErr)
+		lastErr = unwrapExecutionBoundaryError(lastErr)
+		if !fallbackPhase(opts) && fallbackPassWorthTrying(lastErr) && m.hasFallbackForRoute(normalized, retryModel) {
+			if resp, errFallback := m.executeCountMixedOnce(ctx, normalized, req, withFallbackPhase(opts), maxRetryCredentials, 0, defaultRequestRetry); errFallback == nil {
+				return resp, nil
+			} else if hasUpstreamExecutionAttempt(errFallback) {
+				lastErr = unwrapExecutionBoundaryError(errFallback)
+			}
+		}
+		return cliproxyexecutor.Response{}, lastErr
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -299,6 +377,14 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			lastErr = preferredExecutionAttemptError(lastErr, preferredUpstreamErr)
 		}
 		lastErr = unwrapExecutionBoundaryError(lastErr)
+		if !fallbackPhase(opts) && fallbackPassWorthTrying(lastErr) && m.hasFallbackForRoute(normalized, retryModel) {
+			fallbackHomeRetryLimit := homeRetryLimit
+			if result, errFallback := m.executeStreamMixedOnce(ctx, normalized, req, withFallbackPhase(opts), maxRetryCredentials, &fallbackHomeRetryLimit, 0, defaultRequestRetry); errFallback == nil {
+				return result, nil
+			} else if hasUpstreamExecutionAttempt(errFallback) {
+				lastErr = unwrapExecutionBoundaryError(errFallback)
+			}
+		}
 		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
 				return nil, errCredits
@@ -470,7 +556,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		execCtx = newUpstreamAttemptContext(execCtx)
 
-		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel, fallbackPhase(opts))
 		if len(models) == 0 {
 			continue
 		}
@@ -581,6 +667,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			logFallbackServed(execCtx, auth, routeModel, upstreamModel, fallbackPhase(opts))
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
@@ -661,7 +748,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		execCtx = newUpstreamAttemptContext(execCtx)
 
-		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel, fallbackPhase(opts))
 		if len(models) == 0 {
 			continue
 		}
@@ -776,6 +863,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			logFallbackServed(execCtx, auth, routeModel, upstreamModel, fallbackPhase(opts))
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
@@ -956,7 +1044,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		// Enrich before auth preparation so prepare-stage usage records observe the client request.
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		execCtx = newUpstreamAttemptContext(execCtx)
-		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel, fallbackPhase(opts))
 		if selection != nil && aliasResult.ForceMapping && responseAlias != "" {
 			aliasResult.OriginalAlias = responseAlias
 		}

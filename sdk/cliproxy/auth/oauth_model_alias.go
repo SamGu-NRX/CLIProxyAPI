@@ -455,6 +455,100 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 	return OAuthModelAliasResult{}
 }
 
+const fallbackModelsAttributeKey = "fallback_models"
+
+// SetFallbackModelsAttribute stores a credential's last-resort upstreams on the auth entry.
+// Entries with an empty name or alias are dropped; an empty list removes the attribute.
+func SetFallbackModelsAttribute(auth *Auth, fallbacks []internalconfig.FallbackModel) {
+	if auth == nil {
+		return
+	}
+	clean := make([]internalconfig.FallbackModel, 0, len(fallbacks))
+	for _, f := range fallbacks {
+		name := strings.TrimSpace(f.Name)
+		alias := strings.TrimSpace(f.Alias)
+		if name == "" || alias == "" {
+			continue
+		}
+		clean = append(clean, internalconfig.FallbackModel{Name: name, Alias: alias})
+	}
+	if len(clean) == 0 {
+		if auth.Attributes != nil {
+			delete(auth.Attributes, fallbackModelsAttributeKey)
+		}
+		return
+	}
+	data, err := json.Marshal(clean)
+	if err != nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes[fallbackModelsAttributeKey] = string(data)
+}
+
+// FallbackModelsFromAttributes returns the credential's declared last-resort upstreams.
+func FallbackModelsFromAttributes(attributes map[string]string) []internalconfig.FallbackModel {
+	if attributes == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(attributes[fallbackModelsAttributeKey])
+	if raw == "" {
+		return nil
+	}
+	var out []internalconfig.FallbackModel
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// FallbackUpstreamModels returns the upstream model names the credential declares as
+// last-resort candidates for the requested client-visible model, in declared order. Only the
+// credential's own `fallback_models` are consulted: a fallback is an account entitlement
+// (Codex "gpt-reserve" exists on some accounts and not others), so it belongs on the
+// credential, never in the global alias table where it would apply to accounts that cannot
+// serve it. The ordinary alias resolver never sees these entries, so a credential can carry
+// both `gpt-5.6-luna -> X` (ordinary) and `gpt-reserve` (last resort) for the same X
+// without the two fighting over which one is "the" upstream.
+func FallbackUpstreamModels(auth *Auth, requestedModel string) []string {
+	fallbacks := FallbackModelsFromAttributes(authAttributes(auth))
+	if len(fallbacks) == 0 {
+		return nil
+	}
+	requestResult, candidates := modelAliasLookupCandidates(requestedModel)
+	if len(candidates) == 0 {
+		return nil
+	}
+	out := make([]string, 0, 1)
+	seen := make(map[string]struct{}, 1)
+	for _, candidate := range candidates {
+		key := strings.TrimSpace(candidate)
+		if key == "" {
+			continue
+		}
+		for _, entry := range fallbacks {
+			name := strings.TrimSpace(entry.Name)
+			alias := strings.TrimSpace(entry.Alias)
+			if name == "" || alias == "" || !strings.EqualFold(alias, key) {
+				continue
+			}
+			resolved := preserveResolvedModelSuffix(name, requestResult)
+			lower := strings.ToLower(resolved)
+			if _, dup := seen[lower]; dup {
+				continue
+			}
+			seen[lower] = struct{}{}
+			out = append(out, resolved)
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
 // modelAliasChannel extracts the OAuth model alias channel from an Auth object.
 // It determines the provider and auth kind from the Auth's attributes and delegates
 // to OAuthModelAliasChannel for the actual channel resolution.

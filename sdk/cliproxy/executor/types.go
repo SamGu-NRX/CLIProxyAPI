@@ -11,6 +11,12 @@ import (
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
 const RequestedModelMetadataKey = "requested_model"
 
+// FallbackPhaseMetadataKey, when set to "1", admits per-auth fallback upstreams (aliases with
+// `fallback: true`) into candidate enumeration and selector availability. Unset, every
+// fallback is invisible: the ordinary pass exhausts every credential's ordinary upstream
+// across the whole pool before a second pass is even attempted.
+const FallbackPhaseMetadataKey = "fallback_phase"
+
 // RequestPathMetadataKey stores the inbound HTTP request path (e.g. "/v1/images/generations") in Options.Metadata.
 // It is optional and may be absent for non-HTTP executions.
 const RequestPathMetadataKey = "request_path"

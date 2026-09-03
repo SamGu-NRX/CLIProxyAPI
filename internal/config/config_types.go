@@ -262,6 +262,23 @@ type OAuthModelAlias struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
+// FallbackModel is a last-resort upstream for a client-visible model, declared per credential
+// under the `fallback_models` key. It is appended to the execution candidates only after every
+// ordinary candidate and tried only when those are cooling; a credential whose ordinary
+// candidate is cooling but whose fallback is not still counts as available for the route
+// model. Used to reach a separate upstream allowance (Codex "gpt-reserve") without ever
+// requesting it while ordinary capacity remains, which is the one pattern the official
+// client never produces.
+//
+// It is a separate key rather than a flag on `model_aliases` on purpose: a binary without
+// this feature ignores unknown JSON keys, so a flagged alias was read by the pre-feature
+// gateway as a plain rename and sent gpt-reserve upstream on fresh windows (observed live,
+// 2026-09-02). An unknown key degrades to "no fallback", which is the safe direction.
+type FallbackModel struct {
+	Name  string `json:"name"`
+	Alias string `json:"alias"`
+}
+
 // PayloadConfig defines default and override parameter rules applied to provider payloads.
 type PayloadConfig struct {
 	// Default defines rules that only set parameters when they are missing in the payload.

@@ -1461,7 +1461,36 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 	if auth == nil || strings.TrimSpace(routeModel) == "" {
 		return false
 	}
+	if len(FallbackUpstreamModels(auth, routeModel)) > 0 {
+		// The scheduler fast path tracks one model per auth. An auth with a fallback has two
+		// independently cooled upstreams for this route, which only the legacy selector reads.
+		return true
+	}
 	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
+}
+
+// fallbackPhase reports whether this request is in its second, fallback-admitting pass.
+func fallbackPhase(opts cliproxyexecutor.Options) bool {
+	if opts.Metadata == nil {
+		return false
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.FallbackPhaseMetadataKey]
+	if !ok {
+		return false
+	}
+	value, isString := raw.(string)
+	return isString && value == "1"
+}
+
+func withFallbackPhase(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	opts.EnsureMetadata()
+	meta := make(map[string]any, len(opts.Metadata)+1)
+	for k, v := range opts.Metadata {
+		meta[k] = v
+	}
+	meta[cliproxyexecutor.FallbackPhaseMetadataKey] = "1"
+	opts.Metadata = meta
+	return opts
 }
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
